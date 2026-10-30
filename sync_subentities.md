@@ -3,7 +3,7 @@
 - Backend: `SyncSubEntities` in [services/setting.go](../services/setting.go)
 - Tests: `TestSubEntityAccessGrants`, `TestRemoveStaleSubEntityAccess` in [setting_sync_test.go](../services/setting_sync_test.go), `TestSyncSubEntitiesRejectsRequest` in [setting_test.go](../services/setting_test.go)
 - Related: [SUB_ENTITY_AND_DOMAIN_TECHNICAL.md](SUB_ENTITY_AND_DOMAIN_TECHNICAL.md) (section 14), [VENDOR_LIST_FLOW.md](VENDOR_LIST_FLOW.md), [KAM_MAPPING_FLOW.md](KAM_MAPPING_FLOW.md), [USER_ACCESS_FLOW.md](USER_ACCESS_FLOW.md)
-- Status: not wired to an API route yet (no proto RPC, no controller).
+- API: `POST /customsvc/flipkart/api/v1/sync-sub-entities` (`SyncSubEntities` RPC in `setting.proto`, controller in [controllers/setting.go](../controllers/setting.go))
 
 ## 1. What it does
 
@@ -101,14 +101,14 @@ sequenceDiagram
     participant C as Caller
     participant S as SyncSubEntities
     participant V as VendorBuMapping
-    participant G as subEntityAccessGrants
+    participant G as subEntityIdsAccessGrants
     participant U as CreateFKDomainUsers
     participant R as removeStaleSubEntityAccess
     participant FK as Flipkart DB
     participant P as Platform
 
     C->>S: request
-    S->>S: checks (CONTROLLER, operator domain, DOMAIN_OWNERS)
+    S->>S: checks (not TECH, CONTROLLER, operator domain, DOMAIN_OWNERS)
     S->>V: step 1
     V->>FK: read vendors, BUs, fk_vendor_bu_mapping
     V->>P: create missing sub-entities
@@ -131,6 +131,7 @@ Checked in order. The first failure is returned. Nothing runs.
 | Check | Fails → |
 |---|---|
 | Claim in context | invalid JWT claims |
+| User is not TECH (`denyTechUser`) | `PermissionDenied`: *TECH users have read-only access* |
 | User group is CONTROLLER | `PermissionDenied`: *only CONTROLLER users can sync sub-entities* |
 | Domain is the operator domain | *invalid domain type for sub-entities sync* |
 | Domain role is DOMAIN_OWNERS | *invalid role for sub-entities sync* |
@@ -171,11 +172,11 @@ retailers · vendors · BUs · `fk_vendor_bu_mapping` · KAM mappings · BizFin 
 
 Any read error stops the sync.
 
-**globalUsers** = emails of CONTROLLER and TECH user access rows that are not INACTIVE (an empty status counts as active). They see every vendor, so they never get sub-entities and their domain role is never changed.
+**globalUsers** = emails of CONTROLLER and TECH user access rows that are not INACTIVE (an empty status counts as active). They see every vendor, so they never get sub-entities. In step 6 their domain role is set ACTIVE.
 
-## 8. Step 3 — Work out grants (`subEntityAccessGrants`)
+## 8. Step 3 — Work out grants (`subEntityIdsAccessGrants`)
 
-This step only computes. It writes nothing. It returns `userMappings`: one entry per user × domain with the sub-entity ids that user should have.
+This step only computes. It writes nothing. It returns `userMappings` (plus an error): one entry per user × domain with the sub-entity ids that user should have.
 
 ```mermaid
 flowchart TD
@@ -221,10 +222,15 @@ Rules:
 flowchart TD
     IN["userMappings"] --> D{"Domain exists and user is a member?<br/>(in domains.users AND in users.domain_roles)"}
     D -->|yes| E1["UpdateSubEntities<br/>insert sub_entity_user_mappings<br/>ON CONFLICT DO NOTHING"]
-    E1 --> E2["updateUserDomainRoles<br/>add sub-entities to the role copy<br/>status → ACTIVE if not ACTIVE"]
+    E1 --> E2["updateUserDomainRoles<br/>add sub-entities to the role copy<br/>status → ACTIVE if not ACTIVE (empty too)"]
     D -->|no| N1["Domain API AddUsers<br/>(invites users not on the platform)"]
-    N1 --> N2["SetUserDomainStatus ACTIVE<br/>for users already on the platform"]
+    N1 --> N2["SetUserDomainStatus ACTIVE<br/>for users already on the platform<br/>(any status that is not ACTIVE)"]
 ```
+
+What the platform `AddUsers` (`attachDomain2User` in `app/platform/services/domains.go`) does per user:
+
+1. If the user already has a role for the domain, it is updated: role, authorized roles, invited on/by, and sub-entities (union, no duplicates). Before, an existing role was kept as it was.
+2. `sub_entity_user_mappings` rows are written **before** the user is saved. If that write fails, `AddUsers` returns an error and the user is not saved, so the role copy never claims sub-entities the table doesn't have.
 
 This step only adds. Removal is step 5.
 
@@ -245,7 +251,7 @@ flowchart TD
         M1{"Has ids in given<br/>for this domain?"}
         M1 -->|yes| A["Domain role ACTIVE"]
         M1 -->|no| M2{"globalUser or<br/>domain owner?"}
-        M2 -->|yes| L["Leave role as it is"]
+        M2 -->|yes| L["Domain role ACTIVE"]
         M2 -->|no| I["Domain role INACTIVE<br/>(blocked from the domain)"]
     end
 
@@ -274,7 +280,7 @@ What the sync does:
 | `v1@vapusdata.com` | adds `V1-Large` | — | ACTIVE |
 | `kam@x.com` | — | removes `V2-Mobile` | ACTIVE |
 | `old@acme.com` | — | removes `V1-Mobile` | INACTIVE |
-| `ctrl@x.com` | — | — | left as it is |
+| `ctrl@x.com` | — | — | ACTIVE (global user) |
 
 A second run finds nothing to change.
 
@@ -304,8 +310,7 @@ The Sync Users button queues `SyncDomainAndUsers` through nabrunner. It works ou
 
 ## 14. Known limits
 
-- Not callable yet: needs a proto RPC and a controller.
 - Sub-entities given by hand in a retailer domain are removed.
 - Platform sub-entities are never deleted. Deleting a vendor only soft-deletes its `fk_vendor_bu_mapping` rows.
 - INACTIVE domains are not skipped on this branch (that change is on `flipkart-domain-users-active`).
-- `SetUserDomainStatus(ACTIVE)` on this branch revives only an INACTIVE role; an empty status is left empty (both count as active).
+- A domain owner who also gets sub-entities is set to DOMAIN_USERS in step 4 (`updateUserDomainRoles` and `AddUsers` write the default role).
