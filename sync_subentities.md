@@ -109,6 +109,8 @@ sequenceDiagram
 
     C->>S: request
     S->>S: checks (not TECH, CONTROLLER, operator domain, DOMAIN_OWNERS)
+    S-->>C: "Sub Entities: Sync Started"
+    Note over S: the steps run in the background,<br/>context not cancelled when the request ends
     S->>V: step 1
     V->>FK: read vendors, BUs, fk_vendor_bu_mapping
     V->>P: create missing sub-entities
@@ -119,9 +121,10 @@ sequenceDiagram
     S->>U: step 4: apply userMappings
     U->>P: insert sub_entity_user_mappings, update domain roles, AddUsers
     S->>R: steps 5 and 6: userMappings
+    R->>P: load domains, mappings and users once
     R->>P: delete stale sub_entity_user_mappings
-    R->>P: set domain role ACTIVE / INACTIVE
-    S-->>C: "Sub Entities: Synced Successfully"
+    R->>P: write each changed user's domain roles once
+    S->>S: log "sub-entities sync completed successfully in <duration>"
 ```
 
 ## 5. Step 0 — Who can call
@@ -222,10 +225,29 @@ Rules:
 flowchart TD
     IN["userMappings"] --> D{"Domain exists and user is a member?<br/>(in domains.users AND in users.domain_roles)"}
     D -->|yes| E1["UpdateSubEntities<br/>insert sub_entity_user_mappings<br/>ON CONFLICT DO NOTHING"]
-    E1 --> E2["updateUserDomainRoles<br/>add sub-entities to the role copy<br/>status → ACTIVE if not ACTIVE (empty too)"]
-    D -->|no| N1["Domain API AddUsers<br/>(invites users not on the platform)"]
+    E1 --> E2["updateUserDomainRoles<br/>add sub-entities to the role copy<br/>status → ACTIVE if not ACTIVE (empty too)<br/>an unchanged role is not written"]
+    D -->|no| N1["Domain API AddUsers<br/>(invites users not on the platform)<br/>one domain after the other"]
     N1 --> N2["SetUserDomainStatus ACTIVE<br/>for users already on the platform<br/>(any status that is not ACTIVE)"]
 ```
+
+### Existing member or new member
+
+A user is an **existing member** of a domain only if **both** are true:
+1. the user's id is in the domain's `users` list (`domains_fk.users`), and
+2. the user's row in `users_fk` has a `domain_roles` entry for the domain.
+
+Sub-entities are not part of this check. Anyone else is **new** and goes through `AddUsers`, even if the user already holds every sub-entity. A user who is in the domain's `users` list but has no role there (see [Lost roles](#lost-roles-and-why-new-members-are-added-one-domain-at-a-time)) is therefore added again on every run, until the role is saved.
+
+### Lost roles, and why new members are added one domain at a time
+
+New members are added **one domain after the other**, never in parallel. For each domain the sync calls `AddUsers`, then `SetUserDomainStatus` for the users of that domain.
+
+Reason: both calls read the user's **whole** row in `users_fk` and write the whole `domain_roles` back. A user who is new in several domains was handled by several parallel workers at once. Each worker read the row before the others had written, and the last write removed the roles added by the rest. The domain's own `users` list is a separate row per domain, so it kept the user, and the user ended up listed in a domain without a role there. Every run then added the user again and lost some roles again.
+
+- Seen with a user in about 30 domains: 5 domains listed the user and had the sub-entity rows (written first), but the role was missing. The sync said *adding 1 new user(s)* for those 5 on every run.
+- Now: a domain that fails is logged, the loop goes on with the next domain, and the first error is returned at the end.
+- The sync runs as one background run whose steps run one after the other, so nothing inside it runs in parallel.
+- Other callers of `CreateFKDomainUsers` (user access, KAM mapping, vendors) also add new members one domain at a time.
 
 What the platform `AddUsers` (`attachDomain2User` in `app/platform/services/domains.go`) does per user:
 
@@ -234,9 +256,13 @@ What the platform `AddUsers` (`attachDomain2User` in `app/platform/services/doma
 
 This step only adds. Removal is step 5.
 
+`AddUsers` itself is not safe against another writer of the same user row: its `PutUser` writes the whole row. Callers outside the sync that add the same user to several domains at once can still lose roles.
+
 ## 10. Steps 5 and 6 — Remove stale access, fix roles (`removeStaleSubEntityAccess`)
 
 `userMappings` is turned into a lookup: `given[domain][user][sub-entity id]`.
+
+Everything is loaded once: the retailer domains, each domain's `sub_entity_user_mappings`, and every user who is a member or has a mapping (one `GetUsersByIds` query). The domain roles are changed in memory and each changed user is written once at the end, instead of a read and a write per user and change.
 
 ```mermaid
 flowchart TD
@@ -244,7 +270,7 @@ flowchart TD
         R1["Read sub_entity_user_mappings of the domain<br/>= what users HAVE"] --> R2{"Sub-entity in given<br/>for this user?"}
         R2 -->|yes| Keep["Keep"]
         R2 -->|no| Stale["Stale"]
-        Stale --> Del["DeleteUserSubEntities per user<br/>(table row + role copy)<br/>never with an empty list"]
+        Stale --> Del["DeleteUserSubEntityRows per user (table rows)<br/>role copy fixed in memory<br/>never with an empty list"]
     end
 
     subgraph s6["Step 6: per member of each retailer domain"]
@@ -256,10 +282,12 @@ flowchart TD
     end
 
     s5 --> s6
+    s6 --> W["UpdateUserDomainRoles<br/>once per changed user"]
 ```
 
 - Stale examples: deleted vendor, removed login ID, removed KAM entry, deleted or INACTIVE BizFin, sub-entity given by hand.
-- `DeleteUserSubEntities` with an empty list deletes **all** of the user's sub-entities in the domain, so the sync never calls it empty.
+- `DeleteUserSubEntityRows` with an empty list deletes **all** of the user's sub-entities in the domain, so the sync never calls it empty.
+- Only a role whose status changes in step 6 is written; a user unchanged in both steps is not written.
 - INACTIVE is needed: without it, a user who lost every sub-entity would see every vendor. Members stay in `domains.users`; only the role status changes.
 
 ## 11. Example
@@ -286,13 +314,15 @@ A second run finds nothing to change.
 
 ## 12. Errors
 
-No step is rolled back. Work already done stays. Run the sync again.
+Only step 0 answers the caller. Steps 1–6 run in the background after the response, so their result is in the logs. No step is rolled back. Work already done stays. Run the sync again.
 
-| Fails in | Returned | Already done |
-|---|---|---|
-| Step 0 | the check's message | nothing |
-| Step 1 | *error while syncing vendor-bu mapping* | sub-entities created before the failure |
-| Steps 2–6 | *error while creating flipkart domain users* | grants, removals and role changes done so far |
+| Fails in | Caller gets | Logged | Already done |
+|---|---|---|---|
+| Step 0 | the check's message | — | nothing |
+| Step 1 | *Sub Entities: Sync Started* | *error while syncing vendor-bu mapping, sub-entities sync stopped* | sub-entities created before the failure |
+| Steps 2–6 | *Sub Entities: Sync Started* | *error while syncing sub-entity access of the users, sub-entities sync stopped* | grants, removals and role changes done so far |
+| Panic | *Sub Entities: Sync Started* | *sub-entities sync stopped by a panic: ...* (the service keeps running) | work done before the panic |
+| — (success) | *Sub Entities: Sync Started* | *sub-entities sync completed successfully in <duration>* | everything |
 
 ## 13. Compared with the Sync Users button
 
@@ -306,11 +336,12 @@ The Sync Users button queues `SyncDomainAndUsers` through nabrunner. It works ou
 | Removes access | never | yes, plus INACTIVE where nothing is left |
 | Any empty table | whole sync fails | fewer grants, sync goes on |
 | Creates domains | yes | no |
-| Result shown to the caller | "task enqueued"; failures only in logs | direct response |
+| Result shown to the caller | "task enqueued"; failures only in logs | "sync started"; failures only in logs |
 
 ## 14. Known limits
 
 - Sub-entities given by hand in a retailer domain are removed.
 - Platform sub-entities are never deleted. Deleting a vendor only soft-deletes its `fk_vendor_bu_mapping` rows.
-- INACTIVE domains are not skipped on this branch (that change is on `flipkart-domain-users-active`).
-- A domain owner who also gets sub-entities is set to DOMAIN_USERS in step 4 (`updateUserDomainRoles` and `AddUsers` write the default role).
+- The caller is not told whether the run worked: check the logs for the *completed* or *stopped* line.
+- A domain owner who also gets sub-entities is set to DOMAIN_USERS in step 4 (`updateUserDomainRoles` and `AddUsers` write the default role). This could be improved: `CreateFKDomainUsers` could keep DOMAIN_OWNERS for a user who already owns the domain, so a user is never downgraded.
+
